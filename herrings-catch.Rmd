@@ -1,0 +1,253 @@
+---
+title: "Stopniowe karłowace śledzi oceanicznych wyławianych w Europie"
+author: "Stanisław Kaczmarek"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE)
+```
+
+# Wstęp
+
+Na przestrzeni ostatnich lat zauważono stopniowy spadek rozmiaru śledzia oceanicznego wyławianego w Europie. 
+
+W raporcie przedstawiona jest analiza danych zebranych na przestrzeni 60 lat, w celu wyznaczenia przyczyn stopniowego karłowacenia śledzi. Najbardziej prawdopodobną przyczyną okazuje się być wzrost temperatury wód przy powierzchni oraz natężenia połowów w regionie. 
+
+# Raport
+
+## Wykorzystane biblioteki
+
+```{r imports}
+library(knitr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(reshape2)
+library(ggcorrplot)
+library(gganimate)
+library(caret)
+library(pander)
+```
+
+```{r list_libs}
+packages <- sessionInfo()$otherPkgs %>%
+  vapply(function(x) x$Version, character(1))
+knitr::kable(packages, col.names = c('Wersja'))
+```
+
+## Wczytanie zbioru danych 
+
+```{r read_csv}
+df <- read.csv2("./sledzie.csv", header=TRUE, sep=",", na.strings="?", dec=".", 
+                colClasses=c(integer(), rep(numeric(), 13), integer(), numeric()))
+```
+
+### Opis atrybutów
+```{r attr_desc}
+attr_description <- c(
+  X='indeks',
+  length='długość złowionego śledzia [cm]',
+  cfin1='dostępność planktonu [zagęszczenie Calanus finmarchicus gat. 1]',
+  cfin2='dostępność planktonu [zagęszczenie Calanus finmarchicus gat. 2]',
+  chel1='dostępność planktonu [zagęszczenie Calanus helgolandicus gat. 1]',
+  chel2='dostępność planktonu [zagęszczenie Calanus helgolandicus gat. 2]',
+  lcop1='dostępność planktonu [zagęszczenie widłonogów gat. 1]',
+  lcop2='dostępność planktonu [zagęszczenie widłonogów gat. 2]',
+  fbar='natężenie połowów w regionie [ułamek pozostawionego narybku]',
+  recr='roczny narybek [liczba śledzi]',
+  cumf='łączne roczne natężenie połowów w regionie [ułamek pozostawionego narybku]',
+  totaln='łączna liczba ryb złowionych w ramach połowu [liczba śledzi]',
+  sst='temperatura przy powierzchni wody [°C]',
+  sal='poziom zasolenia wody [Knudsen ppt]',
+  xmonth='miesiąc połowu [numer miesiąca]',
+  nao='oscylacja północnoatlantycka [mb]'
+)
+kable(attr_description, col.names=NULL)
+```
+
+### Wstępne obejrzenie wartości atrybutów
+
+```{r}
+pander(summary(df))
+```
+
+## Próba wyznaczenia roku
+
+Aby przeanalizować zmianę długości śledzi w kolejnych latach pomocny byłby atrybut "rok".
+
+Możemy spróbować wyznaczyć taki atrybut zakładając chronologiczny porządek wierszy i opierając się na kolumnie xmonth, oznaczającej miesiąc połowu.
+
+```{r}
+get_year_count <- function(months, direction) {
+  year <- 0
+  prev_month <- if (direction == "asc") -1 else 13
+  multiplier <- if (direction == "asc") 1 else -1
+  for (month in months) {
+    if ((prev_month - month) * multiplier < 0) {
+      year <- year + 1
+    }
+    prev_month <- month
+  }
+  year
+}
+```
+
+Przy założeniu rosnącego porządku chronologicznego uzyskujemy jednak w ten sposób `r get_year_count(df$xmonth, "asc")` lat, natomiast prz porządku malejącym `r get_year_count(df$xmonth, "desc")`, co jest dość dalekie od wspomnianych w opisie zbioru 60 lat.  
+
+Kolejnym podejciem byłoby oparcie się o jakieś roczne wartości, np. kolumnę recr, jednak skoro odrzuciliśmy porządek chronologiczny wierszy bylibyśmy w stanie pogrupować rekordy w lata, ale nie znalibyśmy kolejności tych lat.
+
+## Przetworzenie brakujących wartości
+
+Liczba wartości pustych: `r sum(is.na(df))`
+
+```{r}
+row_na_counts <- data.frame(na_count=rowSums(is.na(df)))
+
+ggplot(row_na_counts, aes(x=na_count)) +
+  geom_histogram() +
+  labs(title="Wartości puste w wierszach")
+
+col_na_counts <- df %>%
+  melt(id.vars="X") %>%
+  filter(is.na(value)) %>%
+  group_by(variable) %>%
+  summarize(na_count=n())
+  
+ggplot(col_na_counts, aes(x=variable, y=na_count)) +
+  geom_bar(stat='identity') +
+  coord_flip() +
+  labs(title="Wartości puste w kolumnach")
+
+rows_with_na <- row_na_counts %>%
+  filter(na_count > 0) %>%
+  nrow
+rows_with_na_perc <- 100 * rows_with_na / nrow(row_na_counts)
+```
+
+Widzimy, że `r rows_with_na_perc`% rekordów posiada conajmniej jedną wartość pustą.
+Wydaje się to być zbyt wiele, by po prostu odrzucić takie rekordy.
+Idealnie byłoby zastąpić takie wartości wartościami średnimi w danym roku, jednak nie posiadamy atrybutu rok, zamiast tego posłuzymy się wartością średnią w całym zbiorze.
+
+```{r handle_na}
+df <- df %>%
+  mutate_if(is.double, ~ replace_na(., mean(., na.rm=TRUE)))
+
+```
+
+## Podsumowanie zbioru danych
+
+Rozmiar zbioru: `r nrow(df)` rekordów
+
+Liczba wartości pustych: `r sum(is.na(df))`
+
+```{r summary, echo=FALSE}
+pander(summary(df))
+```
+
+
+Jak widzimy, wartości średnie nie uległy zmianie względem wcześniej odczytanych wartości.
+
+## Analiza rozkładów wartości atrybutów
+
+```{r analyze_density, fig.height=10, fig.width=10}
+melted_df <- melt(df, id.vars="X")
+
+mean_df <- melted_df %>%
+  group_by(variable) %>%
+  summarize(mean=mean(value))
+
+ggplot(melted_df, aes(x=value)) +
+  geom_density() +
+  geom_vline(aes(xintercept=mean), mean_df, color='red') +
+  facet_wrap(~ variable, scales="free")
+```
+
+## Korelacja między atrybutami
+
+```{r length_corr, fig.width=10, fig.height=2}
+length_corr <- data.frame(cor(df)) %>%
+  select("length") %>%
+  filter(!(rownames(.) %in% c("X", "length")))
+
+ggcorrplot(length_corr, lab=TRUE)
+```
+
+```{r corr_matrix}
+corr_matrix <- df %>%
+  select(length, chel1, lcop1, fbar, sst, nao) %>%
+  cor
+
+ggcorrplot(corr_matrix, lab=TRUE, type="lower")
+```
+
+Najbardziej skorelowane z długością śledzia są atrybuty chel1, lcop1, fbar, sst, nao, jednocześnie możemy zauważyć bardzo dużą korelację atrybutów chel1 i lcop1.
+
+## Animacja zmiany rozkładu długości śledzi w różnych miesiącach
+
+```{r animated, cache=TRUE}
+ggplot(df, aes(x=length)) +
+  geom_density() +
+  transition_time(xmonth) +
+  labs(title="{month.name[frame_time]}")
+```
+
+## Regresor
+
+```{r regression, cache=TRUE}
+set.seed(1234)
+in_training <- createDataPartition(
+  y=df$length,
+  p=.75,
+  list=FALSE
+)
+training <- df[in_training, ]
+testing <- df[-in_training, ]
+
+train_control <- trainControl(
+  method="repeatedcv",
+  number=2,
+  repeats=5
+)
+
+model <- train(
+  length ~ sst + fbar + nao + lcop1,
+  data=training,
+  method="rf",
+  trControl=train_control,
+  tuneGrid=expand.grid(mtry=2)
+)
+
+model
+```
+
+## Wyniki na zbiorze testowym
+```{r}
+y <- predict(
+  model,
+  newdata=testing
+)
+
+pander(c(
+  R2=R2(y, testing$length),
+  RMSE=RMSE(y, testing$length)
+))
+```
+
+## Ważność atrybutów
+
+```{r}
+importance <- varImp(model, scale=FALSE)
+plot(importance)
+```
+
+Jak widzimy najwięsza ważność cechuje:
+
+- sst - temperatura przy powierzchni wody [°C] - wartość ta jest ujemnie skorelowana z długością śledzi, stąd wraz ze wzrostem temperatury obserwujemy spadek długości śledzia
+
+- fbar - natężenie połowów w regionie [ułamek pozostawionego narybku] - wartość jest dadatnio skorelowana z długością śledzia, więc im mniejszy był ułamek pozostawionego narybku, tym mniejsza długość śledzi
